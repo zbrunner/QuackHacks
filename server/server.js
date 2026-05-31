@@ -2,7 +2,13 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const multer = require('multer');
 const { GoogleGenAI, Type } = require('@google/genai');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -349,37 +355,43 @@ const ELEVENLABS_STT_MODEL =
   process.env.ELEVENLABS_STT_MODEL || 'scribe_v1';
 
 app.use('/speak', express.json({ limit: '32kb' }));
-app.use(
-  '/transcribe',
-  express.raw({
-    type: ['audio/webm', 'audio/wav', 'audio/mp4', 'audio/ogg', 'audio/mpeg'],
-    limit: '20mb',
-  })
-);
+// /transcribe accepts EITHER multipart (FormData with field "audio") OR a
+// raw audio body. Mobile clients should use multipart — it's much more
+// reliable for file uploads on React Native.
+const transcribeMiddleware = (req, res, next) => {
+  const ct = (req.headers['content-type'] || '').toLowerCase();
+  if (ct.startsWith('multipart/')) {
+    return upload.single('audio')(req, res, next);
+  }
+  return express.raw({ type: () => true, limit: '20mb' })(req, res, next);
+};
 
-app.post('/transcribe', async (req, res) => {
+app.post('/transcribe', transcribeMiddleware, async (req, res) => {
   if (!ELEVENLABS_KEY) {
     return res
       .status(503)
       .json({ error: 'ELEVENLABS_API_KEY not set in .env' });
   }
-  if (!req.body || req.body.length === 0) {
+  const audioBuffer = req.file?.buffer || req.body;
+  const audioMime =
+    req.file?.mimetype || req.headers['content-type'] || 'audio/mp4';
+  if (!audioBuffer || audioBuffer.length === 0) {
+    console.error('[transcribe] empty body');
     return res.status(400).json({ error: 'empty audio body' });
   }
   try {
-    const contentType = req.headers['content-type'] || 'audio/webm';
-    const ext = contentType.includes('webm')
+    const ext = audioMime.includes('webm')
       ? 'webm'
-      : contentType.includes('wav')
+      : audioMime.includes('wav')
       ? 'wav'
-      : contentType.includes('mp4')
-      ? 'mp4'
-      : contentType.includes('ogg')
+      : audioMime.includes('mp4') || audioMime.includes('m4a')
+      ? 'm4a'
+      : audioMime.includes('ogg')
       ? 'ogg'
-      : 'webm';
+      : 'm4a';
 
     const fd = new FormData();
-    const blob = new Blob([req.body], { type: contentType });
+    const blob = new Blob([audioBuffer], { type: audioMime });
     fd.append('file', blob, `audio.${ext}`);
     fd.append('model_id', ELEVENLABS_STT_MODEL);
 
@@ -393,54 +405,78 @@ app.post('/transcribe', async (req, res) => {
     );
     if (!response.ok) {
       const errText = await response.text();
-      console.error('ElevenLabs STT error:', response.status, errText);
+      console.error('[transcribe] ElevenLabs error', response.status, errText);
       return res.status(response.status).json({ error: errText });
     }
     const data = await response.json();
+    console.log(
+      `[transcribe] ${audioBuffer.length}B ${audioMime} → ElevenLabs:`,
+      JSON.stringify(data).slice(0, 500)
+    );
     res.json({ text: data.text || '' });
   } catch (err) {
-    console.error('transcribe error:', err.message);
+    console.error('[transcribe] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/speak', async (req, res) => {
+async function generateSpeech(rawText) {
   if (!ELEVENLABS_KEY) {
-    return res
-      .status(503)
-      .json({ error: 'ELEVENLABS_API_KEY not set in .env' });
+    const err = new Error('ELEVENLABS_API_KEY not set in .env');
+    err.status = 503;
+    throw err;
   }
-  const text = (req.body?.text || '').toString().slice(0, 500).trim();
-  if (!text) return res.status(400).json({ error: 'empty text' });
-
-  try {
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
-      {
-        method: 'POST',
-        headers: {
-          'xi-api-key': ELEVENLABS_KEY,
-          'Content-Type': 'application/json',
-          Accept: 'audio/mpeg',
-        },
-        body: JSON.stringify({
-          text,
-          model_id: ELEVENLABS_MODEL,
-          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-        }),
-      }
-    );
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('ElevenLabs error:', response.status, errText);
-      return res.status(response.status).json({ error: errText });
+  const text = (rawText || '').toString().slice(0, 500).trim();
+  if (!text) {
+    const err = new Error('empty text');
+    err.status = 400;
+    throw err;
+  }
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+    {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: ELEVENLABS_MODEL,
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
     }
-    const buf = Buffer.from(await response.arrayBuffer());
+  );
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error('ElevenLabs error:', response.status, errText);
+    const err = new Error(errText);
+    err.status = response.status;
+    throw err;
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
+app.post('/speak', async (req, res) => {
+  try {
+    const buf = await generateSpeech(req.body?.text);
     res.setHeader('Content-Type', 'audio/mpeg');
     res.send(buf);
   } catch (err) {
-    console.error('speak error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// GET form so mobile clients can stream audio directly via a URL
+// (avoids the round-trip of fetching a blob and saving to a temp file).
+app.get('/speak', async (req, res) => {
+  try {
+    const buf = await generateSpeech(req.query.text);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.send(buf);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
