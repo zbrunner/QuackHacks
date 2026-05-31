@@ -1,0 +1,29 @@
+# TTS message templates — edit and refresh the browser to apply.
+# Format: <event>=<template>
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# Available placeholders (only relevant ones substitute per event):
+#   ${name}        — detected product/brand (e.g. "BODYARMOR")
+#   ${matchedFor}  — the grocery list entry it satisfied (e.g. "nutrition drink")
+#   ${horizontal}  — left | center | right
+#   ${vertical}    — top | middle | bottom
+#   ${distance}    — near | medium | far
+
+# Spoken when a new matching product first enters the camera frame.
+match= found item ${name}, it is ${horizontal}, ${vertical}.
+
+# Spoken when an ambiguous detection needs user confirmation.
+review=Does ${name} match ${matchedFor}? Say yes or no.
+
+# Spoken once when voice input is enabled, to remind the user of available commands.
+voice_enabled=Voice ready. Say start list to dictate grocery items, or start detection to begin scanning.
+
+# Spoken while find-mode is active and a DIFFERENT matching item passes through view.
+passed=Heads up, you passed ${name}, ${horizontal}, ${distance}.
+
+# Spoken when the user asks for help. Keep it concise.
+help=You can say: start list to dictate grocery items, end list to finish. Start detection to scan. Help me find it to locate the last detected item. Read this to hear text on a label. Yes or no to answer review questions. Stop or found it to exit find mode.
+
+# Spoken periodically during find mode to guide the user toward centering.
+# ${direction} substitutes to "left", "right", or "centered".
+direction=${direction}

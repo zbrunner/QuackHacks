@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Grocery Vision POC</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+    .stage { position: relative; display: inline-block; }
+    video { width: 100%; max-width: 640px; display: block; background: #000; }
+    canvas.overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    .controls { margin: 1rem 0; display: flex; flex-direction: column; gap: 0.5rem; }
+    .row { display: flex; gap: 0.5rem; align-items: center; }
+    textarea { width: 100%; height: 80px; font-family: inherit; }
+    .match { background: #c8f7c8; padding: 0.5rem; margin: 0.25rem 0; border-radius: 4px; }
+    .review { padding: 0.5rem; margin: 0.25rem 0; border-radius: 4px; background: #fff4d4; }
+    .review.current { background: #ffe08a; border-left: 4px solid #f5a623; }
+    .miss { color: #888; }
+    #log {
+      max-height: 240px;
+      overflow-y: auto;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      line-height: 1.4;
+      background: #111;
+      color: #ddd;
+      padding: 0.5rem;
+      border-radius: 4px;
+      white-space: pre-wrap;
+    }
+    #log .lvl-warn { color: #f6c453; }
+    #log .lvl-error { color: #ff6b6b; }
+    #log .lvl-find { color: #6cf; }
+    #log .lvl-ping { color: #9f9; }
+    #status { font-size: 0.9rem; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Grocery Vision POC</h1>
+
+  <div class="controls">
+    <label>Grocery list (one per line):</label>
+    <textarea id="list">apple
+banana
+bottle
+bread</textarea>
+    <div class="row">
+      <button id="toggle">Start</button>
+      <span id="status"></span>
+    </div>
+    <div class="row">
+      <button id="voiceToggle">Enable voice</button>
+      <span id="voiceState">voice: off</span>
+      <span id="heard"></span>
+    </div>
+    <div class="row">
+      <button id="ttsToggle">Voice output: off</button>
+      <span id="ttsState"></span>
+    </div>
+  </div>
+
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay" class="overlay"></canvas>
+  </div>
+
+  <h2>Matches</h2>
+  <div id="matches"></div>
+
+  <h2>Needs review</h2>
+  <div id="review"></div>
+
+  <h2>All detected objects</h2>
+  <div id="all"></div>
+
+
+  <h2 style="margin-top:1rem;">
+    Logs
+    <button id="clearLog" style="margin-left: 1rem; font-size: 0.7rem;">clear</button>
+    <label style="margin-left: 0.5rem; font-size: 0.7rem; font-weight: normal;">
+      <input type="checkbox" id="logVerbose" checked />
+      verbose (every ping)
+    </label>
+  </h2>
+  <div id="log"></div>
+
+  <script>
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const overlayCtx = overlay.getContext('2d');
+    const captureCanvas = document.createElement('canvas');
+    const captureCtx = captureCanvas.getContext('2d');
+    const matchesEl = document.getElementById('matches');
+    const reviewEl = document.getElementById('review');
+    const allEl = document.getElementById('all');
+    const logEl = document.getElementById('log');
+    const clearLogBtn = document.getElementById('clearLog');
+    const logVerboseEl = document.getElementById('logVerbose');
+
+    const LOG_MAX = 200;
+    const logBuffer = [];
+    function log(level, msg) {
+      if (level === 'ping' && !logVerboseEl.checked) return;
+      const t = new Date().toTimeString().slice(0, 8);
+      const line = `[${t}] ${level.padEnd(5, ' ')}  ${msg}`;
+      logBuffer.push({ level, line });
+      if (logBuffer.length > LOG_MAX) logBuffer.shift();
+      logEl.innerHTML = logBuffer
+        .slice()
+        .reverse()
+        .map((e) => `<span class="lvl-${e.level}">${e.line.replace(/</g, '&lt;')}</span>`)
+        .join('\n');
+      console.log(line);
+    }
+    clearLogBtn.addEventListener('click', () => {
+      logBuffer.length = 0;
+      logEl.innerHTML = '';
+    });
+
+    const MATCH_AUTO = 0.85;
+    const MATCH_REVIEW = 0.5;
+    const decisions = new Map();
+    const pending = new Map();
+    const NAME_NOISE = new Set([
+      'a', 'an', 'and', 'of', 'the',
+      'box', 'bag', 'bottle', 'bottles', 'can', 'cans', 'carton',
+      'container', 'cup', 'jar', 'package', 'pack',
+    ]);
+
+    function normalizeName(name) {
+      const words = (name || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]/g, ' ')
+        .split(/\s+/)
+        .filter((w) => w && !NAME_NOISE.has(w));
+      return words[0] || '';
+    }
+
+    const reviewKey = (name, matchedFor) =>
+      `${normalizeName(name)}::${(matchedFor || '').toLowerCase()}`;
+
+    const ttsToggle = document.getElementById('ttsToggle');
+    const ttsStateEl = document.getElementById('ttsState');
+    let ttsEnabled = false;
+    const audioQueue = [];
+    let audioPlaying = false;
+    let lastSpokenPendingKey = null;
+    let activeMatchKeys = new Set();
+    const lastAnnounceTime = new Map();
+    const ANNOUNCE_COOLDOWN_MS = 5000;
+
+    let lastAnnouncedMatch = null;
+    let findingTarget = null;
+    let pingTimer = null;
+    let directionInterval = null;
+    let lastSpokenDirection = null;
+    const DIRECTION_INTERVAL_MS = 2000;
+    const CENTER_ZONE_HALF = 0.1;   // |cx-0.5| <= 0.1 counts as centered
+    const SLIGHTLY_THRESHOLD = 0.25; // offset within which to use "slightly"
+    let trackTimeout = null;
+    const TRACK_MIN_GAP_MS = 80;
+    const TRACK_WIDTH = 480;
+    const trackCanvas = document.createElement('canvas');
+    const trackCtx = trackCanvas.getContext('2d');
+
+    let templates = {
+      match: '${name}, ${horizontal}, ${distance}',
+      review: 'Does ${name} match ${matchedFor}? Say yes or no.',
+      voice_enabled:
+        'Voice ready. Say start list to dictate grocery items, or start detection to begin scanning.',
+      passed: 'Heads up, you passed ${name}, ${horizontal}, ${distance}.',
+      help: 'You can say: start list to dictate grocery items, end list to finish. Start detection to scan. Help me find it to locate the last detected item. Read this to hear text on a label. Yes or no to answer review questions. Stop or found it to exit find mode.',
+      direction: '${direction}',
+    };
+
+    let audioUnlocked = false;
+    let webAudioCtx = null;
+    const SILENT_AUDIO =
+      'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+
+    function ensureAudioContext() {
+      if (!webAudioCtx) {
+        webAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const listener = webAudioCtx.listener;
+        if (listener.forwardX) {
+          listener.forwardX.value = 0;
+          listener.forwardY.value = 0;
+          listener.forwardZ.value = -1;
+          listener.upX.value = 0;
+          listener.upY.value = 1;
+          listener.upZ.value = 0;
+        } else if (listener.setOrientation) {
+          listener.setOrientation(0, 0, -1, 0, 1, 0);
+        }
+      }
+      if (webAudioCtx.state === 'suspended') {
+        webAudioCtx.resume().catch(() => {});
+      }
+      return webAudioCtx;
+    }
+
+    function applySpatialPosition(panner, pan, distance, vertical) {
+      const azimuth = pan * MAX_AZIMUTH;
+      const elev = (VERTICAL_ELEV[vertical] ?? 0) * MAX_ELEVATION;
+      const radius = DISTANCE_RADIUS[distance] ?? 2.5;
+      const cosE = Math.cos(elev);
+      panner.positionX.value = radius * Math.sin(azimuth) * cosE;
+      panner.positionY.value = radius * Math.sin(elev);
+      panner.positionZ.value = -radius * Math.cos(azimuth) * cosE;
+    }
+
+    function playPing() {
+      const ctx = ensureAudioContext();
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      const dur = PING_DURATION_MS / 1000;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = PING_FREQ_HZ;
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.25, now + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + dur + 0.05);
+    }
+
+    function startFinding(target) {
+      log('find', `startFinding name="${target.name}" key="${target.key}" matchedFor="${target.matchedFor}" hasInitialBox=${!!target.box}`);
+      if (pingTimer) {
+        clearTimeout(pingTimer);
+        pingTimer = null;
+        log('find', 'cleared existing pingTimer');
+      }
+      const seed = target.box && typeof target.cx === 'number'
+        ? {
+            cx: target.cx,
+            cy: target.cy,
+            distance: target.distance || 'medium',
+            vertical: target.vertical || 'middle',
+            box: target.box,
+          }
+        : null;
+      findingTarget = {
+        key: target.key,
+        name: target.name,
+        matchedFor: target.matchedFor,
+        lastDetection: seed,
+        missedFrames: 0,
+        recentDetections: seed
+          ? [{ t: performance.now(), cx: seed.cx, cy: seed.cy }]
+          : [],
+      };
+      startTracking();
+      speak(`Finding ${target.name}. Sweep the camera until the pings get faster.`);
+      pingTimer = setTimeout(schedulePing, 1200);
+      log('find', 'first schedulePing in 1200ms');
+      lastSpokenDirection = null;
+      if (directionInterval) clearInterval(directionInterval);
+      directionInterval = setInterval(directionCallout, DIRECTION_INTERVAL_MS);
+    }
+
+    function stopFinding(announce, reason) {
+      log('find', `stopFinding reason="${reason || 'unspecified'}" hadTarget=${!!findingTarget} hadTimer=${!!pingTimer}`);
+      stopTracking();
+      findingTarget = null;
+      if (pingTimer) {
+        clearTimeout(pingTimer);
+        pingTimer = null;
+      }
+      if (directionInterval) {
+        clearInterval(directionInterval);
+        directionInterval = null;
+      }
+      lastSpokenDirection = null;
+      if (announce) speak('Stopped finding.');
+    }
+
+    function directionCallout() {
+      if (!findingTarget) return;
+      const pos = predictedPosition();
+      if (!pos) return;
+      // Skip during stale-lock state — silence is more informative there.
+      if (findingTarget.missedFrames > 2) return;
+
+      const dx = pos.cx - 0.5;
+      const dy = pos.cy - 0.5;
+      const dxAbs = Math.abs(dx);
+      const dyAbs = Math.abs(dy);
+      const hCentered = dxAbs <= CENTER_ZONE_HALF;
+      const vCentered = dyAbs <= CENTER_ZONE_HALF;
+
+      let phrase = null;
+      let pan = 0;
+      let vertical = 'middle';
+
+      if (!hCentered) {
+        // Guide horizontal first — needs to be centered before vertical matters.
+        const side = dx < 0 ? 'left' : 'right';
+        const intensity = dxAbs <= SLIGHTLY_THRESHOLD ? 'slightly ' : '';
+        phrase = intensity + side;
+        pan = Math.max(-1, Math.min(1, dx * 2));
+      } else if (!vCentered) {
+        // Horizontally centered — now guide vertically.
+        const side = dy < 0 ? 'up' : 'down';
+        const intensity = dyAbs <= SLIGHTLY_THRESHOLD ? 'slightly ' : '';
+        phrase = intensity + side;
+        vertical = dy < 0 ? 'top' : 'bottom';
+      } else {
+        phrase = 'centered';
+      }
+
+      if (phrase === 'centered') {
+        if (lastSpokenDirection !== 'centered') {
+          speak(format(templates.direction, { direction: 'centered' }));
+          lastSpokenDirection = 'centered';
+        }
+        return;
+      }
+      speak(format(templates.direction, { direction: phrase }), { pan, vertical });
+      lastSpokenDirection = phrase;
+    }
+
+    function startTracking() {
+      if (trackTimeout) return;
+      log('find', `track loop started (chained, min gap ${TRACK_MIN_GAP_MS}ms via /track)`);
+      trackTimeout = setTimeout(trackTick, 0);
+    }
+
+    function stopTracking() {
+      if (trackTimeout) {
+        clearTimeout(trackTimeout);
+        trackTimeout = null;
+        log('find', 'track loop stopped');
+      }
+    }
+
+    async function trackTick() {
+      trackTimeout = null;
+      if (!findingTarget) return;
+      if (!video.srcObject) {
+        trackTimeout = setTimeout(trackTick, 500);
+        return;
+      }
+      let nextDelay = TRACK_MIN_GAP_MS;
+      try {
+        // Compute crop region: 100% per-side padding around last known bbox
+        // (so crop = 3× bbox in each dimension), clamped to [0,1]. After any
+        // miss, fall back to full frame so we can re-acquire fast motion.
+        let cropMinX = 0, cropMinY = 0, cropMaxX = 1, cropMaxY = 1;
+        let cropped = false;
+        const lastBox = findingTarget.lastDetection?.box;
+        if (lastBox && findingTarget.missedFrames === 0) {
+          const w = lastBox.maxX - lastBox.minX;
+          const h = lastBox.maxY - lastBox.minY;
+          cropMinX = Math.max(0, lastBox.minX - w);
+          cropMinY = Math.max(0, lastBox.minY - h);
+          cropMaxX = Math.min(1, lastBox.maxX + w);
+          cropMaxY = Math.min(1, lastBox.maxY + h);
+          cropped = true;
+        }
+        const cropW = cropMaxX - cropMinX;
+        const cropH = cropMaxY - cropMinY;
+        const srcX = cropMinX * video.videoWidth;
+        const srcY = cropMinY * video.videoHeight;
+        const srcW = cropW * video.videoWidth;
+        const srcH = cropH * video.videoHeight;
+
+        trackCanvas.width = TRACK_WIDTH;
+        trackCanvas.height = Math.max(1, Math.round(TRACK_WIDTH * (srcH / srcW)));
+        trackCtx.drawImage(
+          video,
+          srcX, srcY, srcW, srcH,
+          0, 0, trackCanvas.width, trackCanvas.height
+        );
+
+        const blob = await new Promise((resolve) =>
+          trackCanvas.toBlob(resolve, 'image/jpeg', 0.6)
+        );
+        const headers = { 'Content-Type': 'image/jpeg' };
+        const cropTag = cropped
+          ? `crop ${cropMinX.toFixed(2)},${cropMinY.toFixed(2)}→${cropMaxX.toFixed(2)},${cropMaxY.toFixed(2)}`
+          : 'full-frame';
+        log('ping', `track payload ${trackCanvas.width}×${trackCanvas.height} ${blob.size}B ${cropTag}`);
+        headers['X-Target-Name'] = encodeURIComponent(findingTarget.name);
+        headers['X-Target-Category'] = encodeURIComponent(findingTarget.matchedFor || '');
+        // Don't send X-Last-Box when cropping — the crop itself is the hint.
+        if (!cropped && lastBox) {
+          headers['X-Last-Box'] = `${lastBox.minX.toFixed(3)},${lastBox.minY.toFixed(3)},${lastBox.maxX.toFixed(3)},${lastBox.maxY.toFixed(3)}`;
+        }
+
+        const t0 = performance.now();
+        const res = await fetch('/track', { method: 'POST', headers, body: blob });
+        const dt = Math.round(performance.now() - t0);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          log('warn', `track error (${dt}ms): ${err.error || res.statusText}`);
+          nextDelay = 500;
+        } else {
+          const data = await res.json();
+          if (!findingTarget) return;
+          if (!data.found) {
+            findingTarget.missedFrames++;
+            log('find', `track NOT FOUND (${dt}ms ${cropTag}) missed=${findingTarget.missedFrames}`);
+            nextDelay = 300;
+          } else {
+            // Convert from crop-relative coords back to full-frame coords.
+            const newCx = cropMinX + data.cx * cropW;
+            const newCy = cropMinY + data.cy * cropH;
+            const newBox = data.box
+              ? {
+                  minX: cropMinX + data.box.minX * cropW,
+                  minY: cropMinY + data.box.minY * cropH,
+                  maxX: cropMinX + data.box.maxX * cropW,
+                  maxY: cropMinY + data.box.maxY * cropH,
+                }
+              : {
+                  minX: Math.max(0, newCx - 0.05),
+                  minY: Math.max(0, newCy - 0.05),
+                  maxX: Math.min(1, newCx + 0.05),
+                  maxY: Math.min(1, newCy + 0.05),
+                };
+            const last = findingTarget.lastDetection;
+            let rejected = false;
+            if (
+              last &&
+              typeof last.cx === 'number' &&
+              findingTarget.missedFrames === 0
+            ) {
+              const jump = Math.sqrt(
+                (newCx - last.cx) ** 2 + (newCy - last.cy) ** 2
+              );
+              if (jump > 0.6) {
+                findingTarget.missedFrames++;
+                log('warn', `track bbox jump too large (${jump.toFixed(2)}, ${dt}ms) — ignoring`);
+                rejected = true;
+              }
+            }
+            if (!rejected) {
+              const area = Math.max(
+                0,
+                (newBox.maxX - newBox.minX) * (newBox.maxY - newBox.minY)
+              );
+              const distance = area > 0.25 ? 'near' : area > 0.05 ? 'medium' : 'far';
+              const vertical = newCy < 0.33 ? 'top' : newCy < 0.67 ? 'middle' : 'bottom';
+              findingTarget.lastDetection = {
+                cx: newCx, cy: newCy, distance, vertical, box: newBox,
+              };
+              findingTarget.missedFrames = 0;
+              recordDetection(newCx, newCy);
+              log('find', `track SEEN (${dt}ms ${cropTag}) cx=${newCx.toFixed(2)} cy=${newCy.toFixed(2)} dist=${distance}`);
+            }
+          }
+        }
+      } catch (err) {
+        log('warn', `track exception: ${err.message}`);
+        nextDelay = 500;
+      } finally {
+        if (findingTarget) {
+          trackTimeout = setTimeout(trackTick, nextDelay);
+        }
+      }
+    }
+
+    function recordDetection(cx, cy) {
+      if (!findingTarget) return;
+      const arr = findingTarget.recentDetections || (findingTarget.recentDetections = []);
+      const wasShort = arr.length < 2;
+      arr.push({ t: performance.now(), cx, cy });
+      while (arr.length > RECENT_DETECTIONS_MAX) arr.shift();
+      if (wasShort && arr.length >= 2) {
+        log('find', `recent buffer has ${arr.length} entries — prediction active`);
+      }
+    }
+
+    function predictedPosition() {
+      if (!findingTarget) return null;
+      const recent = findingTarget.recentDetections || [];
+      if (recent.length === 0) {
+        return findingTarget.lastDetection
+          ? { cx: findingTarget.lastDetection.cx, cy: findingTarget.lastDetection.cy, predicted: false }
+          : null;
+      }
+      const latest = recent[recent.length - 1];
+      if (recent.length < 2) {
+        return { cx: latest.cx, cy: latest.cy, predicted: false };
+      }
+      const prev = recent[recent.length - 2];
+      const dt = latest.t - prev.t;
+      if (dt <= 0 || dt > 5000) {
+        return { cx: latest.cx, cy: latest.cy, predicted: false };
+      }
+      const vx = (latest.cx - prev.cx) / dt;
+      const vy = (latest.cy - prev.cy) / dt;
+      const now = performance.now();
+      const extrapMs = Math.min(MAX_EXTRAPOLATION_MS, now - latest.t);
+      const cx = Math.max(0, Math.min(1, latest.cx + vx * extrapMs));
+      const cy = Math.max(0, Math.min(1, latest.cy + vy * extrapMs));
+      return { cx, cy, predicted: extrapMs > 30 };
+    }
+
+    function schedulePing() {
+      if (!findingTarget) {
+        log('warn', 'schedulePing fired but findingTarget=null — pings stopped');
+        return;
+      }
+      const last = findingTarget.lastDetection;
+      const missed = findingTarget.missedFrames;
+
+      if (!last || missed > LOST_FRAME_THRESHOLD) {
+        log('ping', `silent tick (no fresh detection, missed=${missed})`);
+        pingTimer = setTimeout(schedulePing, 800);
+        return;
+      }
+
+      const pos = predictedPosition() || last;
+
+      // Centeredness: 1 when item is dead center of frame, 0 at any corner.
+      const cxDist = Math.abs(pos.cx - 0.5) * 2;
+      const cyDist = Math.abs(pos.cy - 0.5) * 2;
+      const offCenter = Math.min(1, Math.sqrt(cxDist * cxDist + cyDist * cyDist));
+      let centeredness = 1 - offCenter;
+
+      // Fade rate during lost state so user can tell the lock is stale.
+      if (missed > 0) {
+        centeredness *= Math.max(0, 1 - missed / LOST_FADE_FRAMES);
+      }
+
+      const rate = PING_RATE_MIN + centeredness * (PING_RATE_MAX - PING_RATE_MIN);
+      const interval = 1000 / rate;
+
+      playPing();
+      const stateTag = missed === 0 ? (pos.predicted ? 'predict' : 'live') : `lost(${missed})`;
+      log('ping', `ping ${stateTag} cx=${pos.cx.toFixed(2)} cy=${pos.cy.toFixed(2)} centered=${centeredness.toFixed(2)} rate=${rate.toFixed(1)}/s`);
+      pingTimer = setTimeout(schedulePing, interval);
+    }
+
+    function downmixToMono(ctx, buffer) {
+      if (buffer.numberOfChannels === 1) return buffer;
+      const mono = ctx.createBuffer(1, buffer.length, buffer.sampleRate);
+      const dst = mono.getChannelData(0);
+      const n = buffer.numberOfChannels;
+      for (let c = 0; c < n; c++) {
+        const src = buffer.getChannelData(c);
+        for (let i = 0; i < src.length; i++) dst[i] += src[i] / n;
+      }
+      return mono;
+    }
+
+    function unlockAudio() {
+      ensureAudioContext();
+      if (audioUnlocked) return;
+      audioUnlocked = true;
+      const a = new Audio(SILENT_AUDIO);
+      a.play().catch(() => {
+        audioUnlocked = false;
+      });
+    }
+
+    (async function loadTemplates() {
+      try {
+        const res = await fetch('/templates');
+        if (res.ok) {
+          const data = await res.json();
+          templates = { ...templates, ...data };
+        }
+      } catch (_) {}
+    })();
+
+    function format(tmpl, vars) {
+      return tmpl.replace(/\$\{(\w+)\}/g, (_, k) => (vars[k] != null ? vars[k] : ''));
+    }
+    const listEl = document.getElementById('list');
+    const statusEl = document.getElementById('status');
+    const toggleBtn = document.getElementById('toggle');
+
+    let intervalId = null;
+    let inFlight = false;
+    let readingNow = false;
+
+    async function start() {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      await video.play();
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+      captureCanvas.width = video.videoWidth;
+      captureCanvas.height = video.videoHeight;
+      intervalId = setInterval(tick, 1000);
+      toggleBtn.textContent = 'Stop';
+    }
+
+    function stop() {
+      clearInterval(intervalId);
+      intervalId = null;
+      const stream = video.srcObject;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
+      toggleBtn.textContent = 'Start';
+      statusEl.textContent = '';
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+
+    toggleBtn.addEventListener('click', () => {
+      if (intervalId) stop(); else start();
+    });
+
+    async function tick() {
+      if (inFlight || readingNow) return;
+      inFlight = true;
+      statusEl.textContent = 'detecting…';
+
+      captureCtx.drawImage(video, 0, 0);
+      const blob = await new Promise((resolve) =>
+        captureCanvas.toBlob(resolve, 'image/jpeg', 0.8)
+      );
+
+      try {
+        const res = await fetch('/detect', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'image/jpeg',
+            'X-Grocery-List': groceryList().join(','),
+          },
+          body: blob,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || res.statusText);
+        }
+        const data = await res.json();
+        render(data.objects || []);
+        statusEl.textContent = `last: ${(data.objects || []).length} objects`;
+      } catch (err) {
+        statusEl.textContent = 'error: ' + err.message;
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    function groceryList() {
+      return listEl.value
+        .split('\n')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+    }
+
+    function classify(obj) {
+      const matchedFor = (obj.matchedFor || '').trim();
+      if (!matchedFor) return 'other';
+      const mc = obj.matchConfidence ?? 0;
+      const key = reviewKey(obj.name, matchedFor);
+      const prior = decisions.get(key);
+      if (prior === 'yes') return 'match';
+      if (prior === 'no') return 'other';
+      if (mc >= MATCH_AUTO) return 'match';
+      if (mc >= MATCH_REVIEW) return 'pending';
+      return 'other';
+    }
+
+    function render(objects) {
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+      const matches = [];
+      const others = [];
+
+      for (const obj of objects) {
+        const outcome = classify(obj);
+        if (outcome === 'match') matches.push(obj);
+        else if (outcome === 'other') others.push(obj);
+        else {
+          const key = reviewKey(obj.name, obj.matchedFor);
+          if (!pending.has(key)) {
+            pending.set(key, {
+              name: obj.name,
+              matchedFor: obj.matchedFor,
+              matchConfidence: obj.matchConfidence ?? 0,
+            });
+          }
+        }
+
+        const { minX, minY, maxX, maxY } = obj.box;
+        const x = minX * overlay.width;
+        const y = minY * overlay.height;
+        const w = (maxX - minX) * overlay.width;
+        const h = (maxY - minY) * overlay.height;
+        const color =
+          outcome === 'match' ? '#0c0' : outcome === 'pending' ? '#f5a623' : '#888';
+        overlayCtx.strokeStyle = color;
+        overlayCtx.lineWidth = outcome === 'match' ? 4 : outcome === 'pending' ? 3 : 2;
+        overlayCtx.strokeRect(x, y, w, h);
+        overlayCtx.fillStyle = color;
+        overlayCtx.font = '16px sans-serif';
+        overlayCtx.fillText(obj.name, x + 4, y + 18);
+      }
+
+      const matchesByEntry = new Map();
+      for (const m of matches) {
+        if (!m.matchedFor) continue;
+        const k = reviewKey(m.name, m.matchedFor);
+        const prev = matchesByEntry.get(k);
+        if (!prev || (m.matchConfidence || 0) > (prev.matchConfidence || 0)) {
+          matchesByEntry.set(k, m);
+        }
+      }
+      const dedupedMatches = [...matchesByEntry.values()];
+
+      matchesEl.innerHTML =
+        dedupedMatches
+          .map((m) => {
+            const p = m.position;
+            return `<div class="match"><strong>${m.name}</strong> <em>(matches "${m.matchedFor}")</em> — ${p.horizontal}, ${p.vertical}, ${p.distance} (${Math.round(m.score * 100)}%)</div>`;
+          })
+          .join('') || '<div class="miss">no matches yet</div>';
+
+      allEl.innerHTML = others
+        .map((o) => `<div>${o.name} (${Math.round(o.score * 100)}%)</div>`)
+        .join('');
+
+      updateReview();
+      announceUpdates(matches);
+    }
+
+    function announceUpdates(matches) {
+      const currentPendingKey =
+        pending.size > 0 ? pending.keys().next().value : null;
+      if (!findingTarget) {
+        if (currentPendingKey && currentPendingKey !== lastSpokenPendingKey) {
+          const item = pending.get(currentPendingKey);
+          speak(format(templates.review, {
+            name: item.name,
+            matchedFor: item.matchedFor,
+          }));
+        }
+        lastSpokenPendingKey = currentPendingKey;
+      }
+
+      const now = Date.now();
+      const seenThisFrame = new Set();
+      for (const m of matches) {
+        if (!m.matchedFor) continue;
+        seenThisFrame.add(reviewKey(m.name, m.matchedFor));
+      }
+
+      const nextActive = new Set();
+      for (const key of activeMatchKeys) {
+        if (seenThisFrame.has(key)) nextActive.add(key);
+      }
+
+      function announceMatch(m, template) {
+        const p = m.position;
+        const pan =
+          typeof m.cx === 'number'
+            ? Math.max(-1, Math.min(1, (m.cx - 0.5) * 2))
+            : 0;
+        speak(
+          format(template, {
+            name: m.name,
+            matchedFor: m.matchedFor,
+            horizontal: p.horizontal,
+            vertical: p.vertical,
+            distance: p.distance,
+          }),
+          { pan, distance: p.distance, vertical: p.vertical }
+        );
+        lastAnnouncedMatch = {
+          key: reviewKey(m.name, m.matchedFor),
+          name: m.name,
+          matchedFor: m.matchedFor,
+          cx: m.cx,
+          cy: m.cy,
+          box: m.box,
+          distance: p.distance,
+          vertical: p.vertical,
+        };
+        log('info', `announced "${m.name}" key="${lastAnnouncedMatch.key}" template=${template === templates.passed ? 'passed' : 'match'}`);
+      }
+
+      if (findingTarget) {
+        const target = matches.find(
+          (m) => reviewKey(m.name, m.matchedFor) === findingTarget.key
+        );
+        if (target) {
+          findingTarget.lastDetection = {
+            cx: target.cx,
+            cy: target.cy,
+            distance: target.position.distance,
+            vertical: target.position.vertical,
+            box: target.box,
+          };
+          findingTarget.missedFrames = 0;
+          recordDetection(target.cx, target.cy);
+          log('find', `target SEEN (detect re-ground) cx=${target.cx.toFixed(2)} cy=${target.cy.toFixed(2)} dist=${target.position.distance}`);
+        } else {
+          findingTarget.missedFrames++;
+          const matchKeys = matches.map((m) => reviewKey(m.name, m.matchedFor)).join(', ') || '(none)';
+          log('find', `target MISSED missed=${findingTarget.missedFrames}. looking for "${findingTarget.key}". this frame keys: [${matchKeys}]`);
+        }
+        // Pings are active — no spoken announcements. Just keep active-key
+        // bookkeeping consistent so things resume cleanly after find ends.
+        for (const m of matches) {
+          if (!m.matchedFor) continue;
+          const key = reviewKey(m.name, m.matchedFor);
+          if (key === findingTarget.key) nextActive.add(key);
+        }
+        activeMatchKeys = nextActive;
+        return;
+      }
+
+      const announcedThisFrame = new Set();
+      for (const m of matches) {
+        if (!m.matchedFor) continue;
+        const key = reviewKey(m.name, m.matchedFor);
+        if (announcedThisFrame.has(key)) continue;
+        if (nextActive.has(key)) continue;
+        if (now - (lastAnnounceTime.get(key) || 0) < ANNOUNCE_COOLDOWN_MS) continue;
+        announceMatch(m, templates.match);
+        announcedThisFrame.add(key);
+        nextActive.add(key);
+        lastAnnounceTime.set(key, now);
+      }
+      activeMatchKeys = nextActive;
+    }
+
+    function updateReview() {
+      if (pending.size === 0) {
+        reviewEl.innerHTML = '<div class="miss">no items needing review</div>';
+        return;
+      }
+      const entries = [...pending.values()];
+      reviewEl.innerHTML = entries
+        .map((item, i) => {
+          const conf = Math.round((item.matchConfidence || 0) * 100);
+          const prefix = i === 0
+            ? '<strong>→ Currently asking:</strong> '
+            : '<span style="color:#888">queued:</span> ';
+          return `<div class="review${i === 0 ? ' current' : ''}">${prefix}Does <strong>${item.name}</strong> match <em>"${item.matchedFor}"</em>? (${conf}% confident) — say "yes" or "no"</div>`;
+        })
+        .join('');
+    }
+
+    ttsToggle.addEventListener('click', () => {
+      unlockAudio();
+      ttsEnabled = !ttsEnabled;
+      ttsToggle.textContent = 'Voice output: ' + (ttsEnabled ? 'on' : 'off');
+      if (!ttsEnabled) {
+        audioQueue.length = 0;
+        ttsStateEl.textContent = '';
+      }
+    });
+
+    const DISTANCE_RADIUS = { near: 1.2, medium: 2.5, far: 5 };
+    const VERTICAL_ELEV = { top: 1, middle: 0, bottom: -1 };
+    const MAX_AZIMUTH = Math.PI / 3;   // ±60°
+    const MAX_ELEVATION = Math.PI / 6; // ±30°
+
+    // Geiger-counter pings: rate scales with how centered the item is in
+    // the camera frame. No spatial audio — direction comes from sweeping
+    // the camera and listening for the rate to climb.
+    const PING_RATE_MIN = 1.5;  // pings/sec at frame edge
+    const PING_RATE_MAX = 8;    // pings/sec when dead center
+    const PING_FREQ_HZ = 880;
+    const PING_DURATION_MS = 70;
+    const LOST_FRAME_THRESHOLD = 12;
+    const LOST_FADE_FRAMES = 6;
+
+    // Predictive interpolation: between server responses, extrapolate the
+    // target position from recent motion so the ping rate stays responsive
+    // even at high Gemini latency.
+    const RECENT_DETECTIONS_MAX = 4;
+    const MAX_EXTRAPOLATION_MS = 600;
+
+    function speak(text, opts) {
+      if (!ttsEnabled || !text) return;
+      const o = opts || {};
+      const pan = Math.max(-1, Math.min(1, o.pan || 0));
+      audioQueue.push({
+        text,
+        pan,
+        distance: o.distance || 'medium',
+        vertical: o.vertical || 'middle',
+      });
+      if (audioPlaying) return;
+      audioPlaying = true;
+      playNext();
+    }
+
+    async function playNext() {
+      const next = audioQueue.shift();
+      if (!next) {
+        audioPlaying = false;
+        return;
+      }
+      const { text, pan, distance, vertical } = next;
+      try {
+        const res = await fetch('/speak', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          ttsStateEl.textContent = 'tts error: ' + (err.error || res.statusText);
+          return playNext();
+        }
+        ttsStateEl.textContent = '';
+        const arrayBuffer = await res.arrayBuffer();
+        const ctx = ensureAudioContext();
+        const decoded = await ctx.decodeAudioData(arrayBuffer);
+        const audioBuffer = downmixToMono(ctx, decoded);
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        const panner = ctx.createPanner();
+        panner.panningModel = 'HRTF';
+        panner.distanceModel = 'inverse';
+        panner.refDistance = 1;
+        panner.rolloffFactor = 0.5;
+        applySpatialPosition(panner, pan, distance, vertical);
+        source.connect(panner).connect(ctx.destination);
+        source.onended = () => {
+          try {
+            source.disconnect();
+            panner.disconnect();
+          } catch (_) {}
+          playNext();
+        };
+        source.start();
+      } catch (err) {
+        ttsStateEl.textContent = 'tts error: ' + err.message;
+        playNext();
+      }
+    }
+
+    function answerCurrentReview(answer) {
+      const firstKey = pending.keys().next().value;
+      if (!firstKey) return false;
+      const item = pending.get(firstKey);
+      decisions.set(firstKey, answer);
+      pending.delete(firstKey);
+      heardEl.textContent =
+        (answer === 'yes' ? 'confirmed: ' : 'rejected: ') +
+        `${item.name} ↔ "${item.matchedFor}"`;
+      updateReview();
+      return true;
+    }
+
+    // ---- Voice control ----
+    const voiceToggle = document.getElementById('voiceToggle');
+    const voiceStateEl = document.getElementById('voiceState');
+    const heardEl = document.getElementById('heard');
+
+    let voiceMode = 'off'; // 'off' | 'idle' | 'listing'
+    let wantOn = false;
+    let audioStream = null;
+    let audioContext = null;
+    let analyser = null;
+    let mediaRecorder = null;
+    let vadInterval = null;
+    let isUserSpeaking = false;
+    let silenceStartTime = null;
+    let hadSpeechThisRecording = false;
+    const SPEECH_THRESHOLD = 0.04;
+    const SILENCE_HANG_MS = 700;
+
+    if (!window.MediaRecorder) {
+      voiceToggle.disabled = true;
+      voiceToggle.textContent = 'Voice not supported';
+    }
+
+    voiceToggle.addEventListener('click', () => {
+      unlockAudio();
+      if (voiceMode === 'off') startVoice();
+      else stopVoice();
+    });
+
+    async function startVoice() {
+      try {
+        audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true },
+        });
+      } catch (err) {
+        heardEl.textContent = 'mic error: ' + err.message;
+        return;
+      }
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContext.createMediaStreamSource(audioStream);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      wantOn = true;
+      startNewRecorder();
+      vadInterval = setInterval(monitorVAD, 100);
+      setVoiceMode('idle');
+      voiceToggle.textContent = 'Disable voice';
+
+      if (!ttsEnabled) {
+        ttsEnabled = true;
+        ttsToggle.textContent = 'Voice output: on';
+      }
+      if (templates.voice_enabled) {
+        speak(format(templates.voice_enabled, {}));
+      }
+    }
+
+    function stopVoice() {
+      wantOn = false;
+      if (vadInterval) {
+        clearInterval(vadInterval);
+        vadInterval = null;
+      }
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        try { mediaRecorder.stop(); } catch (_) {}
+      }
+      if (audioStream) {
+        audioStream.getTracks().forEach((t) => t.stop());
+        audioStream = null;
+      }
+      if (audioContext) {
+        audioContext.close().catch(() => {});
+        audioContext = null;
+      }
+      analyser = null;
+      isUserSpeaking = false;
+      silenceStartTime = null;
+      setVoiceMode('off');
+      voiceToggle.textContent = 'Enable voice';
+    }
+
+    function setVoiceMode(mode) {
+      voiceMode = mode;
+      voiceStateEl.textContent =
+        mode === 'listing'
+          ? 'voice: building list (say "end list" to finish)'
+          : 'voice: ' + mode;
+    }
+
+    function startNewRecorder() {
+      if (!audioStream) return;
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      hadSpeechThisRecording = false;
+      const chunks = [];
+      mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size) chunks.push(e.data);
+      };
+      mediaRecorder.onstop = async () => {
+        const speech = hadSpeechThisRecording;
+        if (wantOn) startNewRecorder();
+        if (!speech) return;
+        const blob = new Blob(chunks, { type: mimeType });
+        if (blob.size < 2000) return;
+        await sendToTranscribe(blob);
+      };
+      mediaRecorder.start();
+    }
+
+    function monitorVAD() {
+      if (!analyser) return;
+      const buf = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / buf.length);
+      const now = performance.now();
+      if (rms > SPEECH_THRESHOLD) {
+        hadSpeechThisRecording = true;
+        isUserSpeaking = true;
+        silenceStartTime = null;
+      } else if (isUserSpeaking) {
+        if (silenceStartTime === null) silenceStartTime = now;
+        else if (now - silenceStartTime > SILENCE_HANG_MS) {
+          isUserSpeaking = false;
+          silenceStartTime = null;
+          if (mediaRecorder && mediaRecorder.state === 'recording') {
+            try { mediaRecorder.stop(); } catch (_) {}
+          }
+        }
+      }
+    }
+
+    function cleanTranscript(text) {
+      return text
+        .replace(/\([^)]*\)/g, '')
+        .replace(/\[[^\]]*\]/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s.,;:!?-]+|[\s.,;:!?-]+$/g, '')
+        .trim();
+    }
+
+    async function sendToTranscribe(blob) {
+      try {
+        heardEl.textContent = 'transcribing…';
+        const res = await fetch('/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': blob.type || 'audio/webm' },
+          body: blob,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          heardEl.textContent =
+            'transcribe error: ' + (err.error || res.statusText);
+          return;
+        }
+        const data = await res.json();
+        const rawTranscript = (data.text || '').trim();
+        const cleaned = cleanTranscript(rawTranscript);
+        if (!cleaned || !wantOn) {
+          if (rawTranscript) log('info', `transcript dropped (cleaned empty or voice off): raw="${rawTranscript}"`);
+          return;
+        }
+        heardEl.textContent = 'heard: "' + cleaned + '"';
+        log('info', `heard: "${cleaned}" (raw: "${rawTranscript}")`);
+        handleUtterance(cleaned.toLowerCase(), cleaned);
+      } catch (err) {
+        heardEl.textContent = 'transcribe error: ' + err.message;
+      }
+    }
+
+    const END_LIST = /\b(end|stop|finish|done)\s+(list|listing)\b/;
+
+    function handleUtterance(lower, original) {
+      if (voiceMode === 'listing') {
+        if (END_LIST.test(lower)) {
+          setVoiceMode('idle');
+          cleanList();
+          return;
+        }
+        appendListItem(original);
+        return;
+      }
+      if (pending.size > 0) {
+        if (/^(yes|yeah|yep|yup|sure|accept|confirm)\b/.test(lower)) {
+          answerCurrentReview('yes');
+          return;
+        }
+        if (/^(no|nope|nah|reject|skip)\b/.test(lower)) {
+          answerCurrentReview('no');
+          return;
+        }
+      }
+      if (findingTarget) {
+        const match = lower.match(/\b(stop|cancel|found it|got it|done|never mind|abort)\b/);
+        if (match) {
+          stopFinding(true, `voice: "${match[0]}" in utterance "${lower}"`);
+          return;
+        }
+      }
+      if (/\b(help me find|guide me|find it|find this|where is it|locate it)\b/.test(lower)) {
+        if (!lastAnnouncedMatch) {
+          log('warn', 'find command but no lastAnnouncedMatch yet');
+          speak('No matching item has been announced yet.');
+          return;
+        }
+        startFinding(lastAnnouncedMatch);
+        return;
+      }
+      if (/^help$|\bwhat (commands|can i say|can i do)\b|\blist commands\b/.test(lower)) {
+        log('info', 'help requested');
+        speak(templates.help);
+        return;
+      }
+      if (/\bread\b.*\b(this|it|that|text|label|sign|package)\b/.test(lower) || /^read$/.test(lower) || /\bwhat does (it|this|that) say\b/.test(lower)) {
+        readThis();
+        return;
+      }
+      if (/\b(start|begin)\s+detection\b/.test(lower)) {
+        if (!intervalId) start();
+        return;
+      }
+      if (/\b(stop|pause|end)\s+detection\b/.test(lower)) {
+        if (intervalId) stop();
+        return;
+      }
+      if (/\b(start|begin|new)\s+list\b/.test(lower)) {
+        setVoiceMode('listing');
+        return;
+      }
+      if (/\bclear\s+list\b/.test(lower)) {
+        listEl.value = '';
+        return;
+      }
+    }
+
+    async function readThis() {
+      if (!video.srcObject) {
+        speak('Please start the camera first.');
+        return;
+      }
+      readingNow = true;
+      heardEl.textContent = 'reading text…';
+      try {
+        captureCtx.drawImage(video, 0, 0);
+        const blob = await new Promise((resolve) =>
+          captureCanvas.toBlob(resolve, 'image/jpeg', 0.85)
+        );
+        const res = await fetch('/read-text', {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: blob,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          heardEl.textContent = 'read error: ' + (err.error || res.statusText);
+          return;
+        }
+        const data = await res.json();
+        const text = (data.text || '').trim();
+        if (!text || /^nothing$/i.test(text)) {
+          speak('No text visible.');
+          return;
+        }
+        heardEl.textContent = 'read: "' + text + '"';
+        speak(text);
+      } catch (err) {
+        heardEl.textContent = 'read error: ' + err.message;
+      } finally {
+        readingNow = false;
+      }
+    }
+
+    function appendListItem(text) {
+      const existing = listEl.value.trim();
+      listEl.value = existing ? existing + '\n' + text : text;
+    }
+
+    async function cleanList() {
+      const items = listEl.value
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!items.length) return;
+      heardEl.textContent = 'cleaning list…';
+      try {
+        const res = await fetch('/clean-list', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || res.statusText);
+        }
+        const data = await res.json();
+        const cleaned = data.cleaned || [];
+        listEl.value = cleaned.join('\n');
+        heardEl.textContent = `cleaned: ${items.length} → ${cleaned.length} items`;
+      } catch (err) {
+        heardEl.textContent = 'clean error: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>

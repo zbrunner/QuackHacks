@@ -41,3 +41,7 @@ app-example
 # generated native folders
 /ios
 /android
+
+# Laptop server (Express) — secrets and deps
+server/.env
+server/node_modules/
