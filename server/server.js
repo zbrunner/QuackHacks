@@ -394,6 +394,9 @@ app.post('/transcribe', transcribeMiddleware, async (req, res) => {
     const blob = new Blob([audioBuffer], { type: audioMime });
     fd.append('file', blob, `audio.${ext}`);
     fd.append('model_id', ELEVENLABS_STT_MODEL);
+    // Pin to English — without this, Scribe auto-detects language and will
+    // confidently transcribe ambient noise as Korean/Chinese/etc.
+    fd.append('language_code', 'eng');
 
     const response = await fetch(
       'https://api.elevenlabs.io/v1/speech-to-text',

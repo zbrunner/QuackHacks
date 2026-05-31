@@ -1,17 +1,25 @@
 import { Ionicons } from "@expo/vector-icons";
 import {
-  AudioModule,
-  RecordingPresets,
   createAudioPlayer,
   setAudioModeAsync,
-  useAudioRecorder,
 } from "expo-audio";
+import * as Speech from "expo-speech";
+import {
+  ExpoSpeechRecognitionModule,
+  useSpeechRecognitionEvent,
+} from "expo-speech-recognition";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as FileSystem from "expo-file-system/legacy";
 import * as Haptics from "expo-haptics";
 import { useRouter } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import {
+  Directions,
+  Gesture,
+  GestureDetector,
+} from "react-native-gesture-handler";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useAuth } from "@/hooks/use-auth";
@@ -58,9 +66,25 @@ type VoiceMode = "idle" | "listing" | "finding";
 const matchKey = (m: { matchedFor: string }) =>
   (m.matchedFor || "").toLowerCase();
 
-const END_LIST_RE = /\b(end|stop|finish|done)\s+(list|listing)\b/;
-const STOP_FIND_RE = /\b(stop|cancel|found it|got it|done|never mind|abort)\b/;
-const START_LIST_RE = /\b(start|begin|new)\s+list\b/;
+// Map ElevenLabs / expo-audio metering (dB, typically -120..0) to a 0..100
+// percentage. Speech sits roughly between -40 and -10 dB.
+const meterPct = (db: number | undefined | null) => {
+  if (db == null || !Number.isFinite(db)) return 0;
+  const min = -50;
+  const max = -5;
+  const clamped = Math.max(min, Math.min(max, db));
+  return Math.round(((clamped - min) / (max - min)) * 100);
+};
+const meterColor = (db: number | undefined | null) => {
+  const pct = meterPct(db);
+  if (pct < 15) return "#666"; // dead silence — looks gray
+  if (pct < 40) return "#4ade80"; // quiet speech
+  return "#22c55e"; // clear speech
+};
+
+const END_LIST_RE = /\b(end|stop|finish|done|save|complete)\s+(the\s+)?(list|listing)\b|\bdone listing\b|\bsave (it|that|the list)\b/;
+const STOP_FIND_RE = /\b(stop|cancel|found it|got it|done|never mind|abort|exit)\b/;
+const START_LIST_RE = /\b(start|begin|new|build|create|make)\s+(a\s+|the\s+)?list\b/;
 const FIND_RE = /\b(help me find|find( it| this| the| target| item)?|locate|where is|guide me)\b/;
 const READ_RE =
   /\bread\b.*\b(this|it|that|text|label|sign|package)\b|^read$|\bwhat does (it|this|that) say\b/;
@@ -73,7 +97,10 @@ export default function Detector() {
   const { user } = useAuth();
   const [permission, requestPermission] = useCameraPermissions();
   const cameraRef = useRef<CameraView>(null);
-  const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  // Native on-device STT via Apple's SFSpeechRecognizer / Android's
+  // SpeechRecognizer. Sidesteps the AVAudioRecorder bug entirely.
+  const [meterDb, setMeterDb] = useState<number | null>(null);
+  const wasLoopingRef = useRef(false);
   const playerRef = useRef<ReturnType<typeof createAudioPlayer> | null>(null);
   const pingLoopPlayerRef = useRef<ReturnType<typeof createAudioPlayer> | null>(
     null
@@ -102,6 +129,10 @@ export default function Detector() {
   const [heard, setHeard] = useState<string>("");
   const [isRecording, setIsRecording] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
+  const welcomeSpokenRef = useRef(false);
+  // Toggled to false during recording so iOS fully releases the camera
+  // capture session (just pausePreview isn't enough to stop the mic conflict).
+  const [cameraVisible, setCameraVisible] = useState(true);
 
   const log = useCallback((level: string, msg: string) => {
     const t = new Date().toTimeString().slice(0, 8);
@@ -123,16 +154,29 @@ export default function Detector() {
   };
 
   // ----- Setup: orientation, audio mode, mic permission, cleanup -----
+  // Stable PlayAndRecord session — toggling categories appears to break the
+  // recorder on second/third attempts. We accept slightly quieter playback
+  // for reliability. shouldRouteThroughEarpiece: false attempts to force the
+  // main speaker even in PlayAndRecord mode.
+  const setPlaybackMode = useCallback(() => Promise.resolve(), []);
+  const setRecordMode = useCallback(() => Promise.resolve(), []);
+
   useEffect(() => {
     log("init", "detector mounted");
+    // Playback-only audio session. Native STT manages its own mic capture
+    // (AVAudioEngine on iOS), so we don't need PlayAndRecord here.
     setAudioModeAsync({
       playsInSilentMode: true,
-      allowsRecording: true,
+      allowsRecording: false,
     }).catch(() => {});
     ScreenOrientation.lockAsync(
       ScreenOrientation.OrientationLock.LANDSCAPE_RIGHT
     ).catch(() => {});
-    AudioModule.requestRecordingPermissionsAsync().catch(() => {});
+    ExpoSpeechRecognitionModule.requestPermissionsAsync()
+      .then((perm: any) =>
+        log("init", `speech perm granted=${perm?.granted ?? "?"}`)
+      )
+      .catch((e: any) => log("error", `perm: ${e?.message || e}`));
     try {
       // Looping ping track — native audio engine handles ping cadence smoothly.
       const loopPlayer = createAudioPlayer(
@@ -177,21 +221,26 @@ export default function Detector() {
   }, []);
 
   // ----- TTS playback -----
-  const speak = useCallback((text: string) => {
-    try {
-      const url = `${SERVER_URL}/speak?text=${encodeURIComponent(text)}`;
-      if (playerRef.current) {
-        try {
-          playerRef.current.remove();
-        } catch {}
+  const speak = useCallback(
+    (text: string) => {
+      try {
+        // Per #43086: flip to playback mode right before play.
+        setPlaybackMode();
+        const url = `${SERVER_URL}/speak?text=${encodeURIComponent(text)}`;
+        if (playerRef.current) {
+          try {
+            playerRef.current.remove();
+          } catch {}
+        }
+        const player = createAudioPlayer({ uri: url });
+        playerRef.current = player;
+        player.play();
+      } catch (err) {
+        console.warn("speak error", err);
       }
-      const player = createAudioPlayer({ uri: url });
-      playerRef.current = player;
-      player.play();
-    } catch (err) {
-      console.warn("speak error", err);
-    }
-  }, []);
+    },
+    [setPlaybackMode]
+  );
 
   // Same as speak() but resolves when playback finishes (or after a safety
   // timeout). Use this when downstream logic must wait for the speech to end.
@@ -328,8 +377,8 @@ export default function Detector() {
     }
     log("haptic", `loop start for ${findingTarget.name}`);
 
-    // Start the loop. Base is 4 pings/sec; playback rate maps to 0.5×–2× (so
-    // 2–8 pings/sec). Pitch shifts with rate as an extra closeness cue.
+    // Start the loop in playback mode (loud main speaker).
+    setPlaybackMode();
     try {
       (loop as any).loop = true;
       loop.seekTo(0);
@@ -472,8 +521,34 @@ export default function Detector() {
           exitListingMode();
           return;
         }
-        log("list", `item: ${text}`);
-        listingItemsRef.current.push(text);
+        // Run the single item through Gemini /clean-list, store the cleaned
+        // version, and read it back so the user can confirm what was added.
+        (async () => {
+          let toAdd = text;
+          try {
+            const res = await fetch(`${SERVER_URL}/clean-list`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ items: [text] }),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              const cleaned = (data.cleaned || [])[0];
+              if (cleaned && typeof cleaned === "string" && cleaned.trim()) {
+                toAdd = cleaned.trim();
+              }
+            }
+          } catch (e: any) {
+            log("error", `clean-list: ${e?.message || e}`);
+          }
+          listingItemsRef.current.push(toAdd);
+          log("list", `item: ${toAdd}${toAdd !== text ? ` (cleaned from "${text}")` : ""}`);
+          // Use native TTS (expo-speech) here, NOT the ElevenLabs streaming
+          // player. The streaming player keeps the iOS audio session locked
+          // in playback mode and breaks the very next recording. Native TTS
+          // plays cleanly without affecting the session.
+          Speech.speak(`Added ${toAdd}`, { rate: 1.05 });
+        })();
         return;
       }
 
@@ -568,67 +643,118 @@ export default function Detector() {
   const handleTapToTalk = useCallback(async () => {
     if (isRecording) return;
     try {
-      const perm = await AudioModule.requestRecordingPermissionsAsync();
-      if (!perm.granted) {
-        log("error", "mic permission denied");
-        setHeard("mic permission denied");
+      const perm =
+        await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+      if (!perm?.granted) {
+        log("error", "speech permission denied");
+        setHeard("speech permission denied");
         return;
       }
-      // Pause the ping loop while recording — otherwise it (a) holds the iOS
-      // audio session in playback mode and (b) bleeds into the mic capture.
+      // Pause the ping loop so it doesn't bleed into recognition.
       const loop = pingLoopPlayerRef.current;
       const wasLooping = !!loop && !!(loop as any).playing;
+      wasLoopingRef.current = wasLooping;
       if (wasLooping) {
         try {
           loop.pause();
-          log("audio", "ping-loop paused for recording");
+          log("audio", "ping-loop paused for recognition");
         } catch {}
       }
-      // Listen tone (cleanly separate from recording).
+      // Unmount the camera while listening — frees iOS capture resources
+      // even though native STT manages its own mic, and it gives the user
+      // a clear "Listening…" screen.
+      setCameraVisible(false);
+      log("audio", "camera unmounted for recognition");
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Listen-tone chime.
       if (listenPlayerRef.current) {
         try {
           listenPlayerRef.current.seekTo(0);
           listenPlayerRef.current.play();
         } catch {}
-        await new Promise((r) => setTimeout(r, 200));
       }
-      await setAudioModeAsync({
-        playsInSilentMode: true,
-        allowsRecording: true,
-      }).catch(() => {});
-      await audioRecorder.prepareToRecordAsync();
-      audioRecorder.record();
-      setIsRecording(true);
-      log("audio", "tap-to-talk: recording");
+      await new Promise((r) => setTimeout(r, 200));
 
-      setTimeout(async () => {
-        try {
-          await audioRecorder.stop();
-          const uri = audioRecorder.uri;
-          log("audio", `stop, uri=${uri ? uri.slice(-30) : "null"}`);
-          if (uri) {
-            sendToTranscribe(uri).catch((e) =>
-              log("error", `send: ${e?.message || e}`)
-            );
-          }
-        } catch (err: any) {
-          log("error", `stop: ${err?.message || err}`);
-        } finally {
-          setIsRecording(false);
-          // Resume the loop only if find mode is still active.
-          if (wasLooping && findingTargetRef.current && loop) {
-            try {
-              loop.play();
-              log("audio", "ping-loop resumed");
-            } catch {}
-          }
-        }
-      }, RECORD_CHUNK_MS);
+      setIsRecording(true);
+      log("audio", "starting native speech recognition");
+      try {
+        ExpoSpeechRecognitionModule.start({
+          lang: "en-US",
+          interimResults: false,
+          maxAlternatives: 1,
+          continuous: false,
+          requiresOnDeviceRecognition: false,
+          addsPunctuation: false,
+          volumeChangeEventOptions: {
+            enabled: true,
+            intervalMillis: 200,
+          },
+          contextualStrings: [
+            "build list",
+            "start list",
+            "end list",
+            "save list",
+            "find",
+            "stop",
+            "found it",
+            "read this",
+            "cereal",
+            "milk",
+            "bread",
+            "cheerios",
+          ],
+        });
+      } catch (e: any) {
+        log("error", `speech start: ${e?.message || e}`);
+        setIsRecording(false);
+        setCameraVisible(true);
+      }
     } catch (err: any) {
-      log("error", `record start: ${err?.message || err}`);
+      log("error", `tap-to-talk: ${err?.message || err}`);
       setIsRecording(false);
+      setCameraVisible(true);
     }
-  }, [audioRecorder, isRecording, log, sendToTranscribe]);
+  }, [isRecording, log]);
+
+  // ----- Native speech recognition event handlers -----
+  useSpeechRecognitionEvent("result", (event: any) => {
+    if (!event.isFinal) return;
+    const transcript = event.results?.[0]?.transcript;
+    if (!transcript) return;
+    log("voice", `heard "${transcript}"`);
+    setHeard(`heard: ${transcript}`);
+    handleUtterance(transcript);
+  });
+
+  useSpeechRecognitionEvent("error", (event: any) => {
+    log("error", `speech: ${event.error} ${event.message || ""}`);
+  });
+
+  useSpeechRecognitionEvent("end", () => {
+    log("audio", "speech recognition ended");
+    setIsRecording(false);
+    setMeterDb(null);
+    setCameraVisible(true);
+    const loop = pingLoopPlayerRef.current;
+    if (wasLoopingRef.current && findingTargetRef.current && loop) {
+      try {
+        loop.play();
+        log("audio", "ping-loop resumed");
+      } catch {}
+    }
+    wasLoopingRef.current = false;
+  });
+
+  useSpeechRecognitionEvent("volumechange", (event: any) => {
+    // Per the library, value is roughly -2..10 — map to dB-ish scale for our
+    // existing meter helpers, which expect dB.
+    if (typeof event.value === "number") {
+      // -2 (silent) → -50 dB; 10 (loud) → -5 dB
+      const dbApprox = -50 + ((event.value + 2) / 12) * 45;
+      setMeterDb(dbApprox);
+    }
+  });
 
   // ----- Detection loop -----
   const tick = useCallback(async () => {
@@ -740,10 +866,65 @@ export default function Detector() {
       requestPermission();
       return;
     }
+    // One-time welcome, once camera permission is granted. Slight delay so the
+    // camera + audio session have time to settle before the TTS plays.
+    if (!welcomeSpokenRef.current) {
+      welcomeSpokenRef.current = true;
+      const t = setTimeout(() => {
+        speak(
+          "Detection started. Swipe up to find an item. Swipe down to build a list. Tap to speak a command."
+        );
+      }, 700);
+      // Don't return cleanup that clears t — we want the welcome to fire even
+      // if the interval-setup re-runs.
+    }
     const ms = findingTarget ? DETECT_INTERVAL_FINDING_MS : DETECT_INTERVAL_MS;
     const interval = setInterval(tick, ms);
     return () => clearInterval(interval);
-  }, [permission?.granted, tick, findingTarget]);
+  }, [permission?.granted, tick, findingTarget, speak]);
+
+  // ----- Gestures: tap to talk, swipe up = find, swipe down = list -----
+  const tapGesture = Gesture.Tap()
+    .runOnJS(true)
+    .onEnd(() => {
+      if (!isRecording) handleTapToTalk();
+    });
+
+  const flingUpGesture = Gesture.Fling()
+    .direction(Directions.UP)
+    .runOnJS(true)
+    .onStart(() => {
+      if (findingTargetRef.current) {
+        log("cmd", "swipe ↑: stop find");
+        stopFinding(true);
+      } else {
+        log("cmd", "swipe ↑: find");
+        startFinding();
+      }
+    });
+
+  const flingDownGesture = Gesture.Fling()
+    .direction(Directions.DOWN)
+    .runOnJS(true)
+    .onStart(() => {
+      if (voiceModeRef.current === "listing") {
+        log("cmd", "swipe ↓: end list");
+        exitListingMode();
+      } else {
+        log("cmd", "swipe ↓: build list");
+        listingItemsRef.current = [];
+        setVoiceMode("listing");
+        speak(
+          "Building list. Tap to record each item. Swipe down to save when done."
+        );
+      }
+    });
+
+  const screenGesture = Gesture.Race(
+    flingUpGesture,
+    flingDownGesture,
+    tapGesture
+  );
 
   // ----- Render -----
   if (!permission) return <View style={styles.container} />;
@@ -765,16 +946,26 @@ export default function Detector() {
 
   return (
     <View style={styles.container}>
-      <CameraView ref={cameraRef} style={styles.camera} facing="back" />
-      <Pressable
-        style={StyleSheet.absoluteFill}
-        onPress={handleTapToTalk}
-        accessibilityRole="button"
-        accessibilityLabel={
-          isRecording ? "Recording" : "Tap anywhere to speak a command"
-        }
-        accessibilityHint="Records a 4-second voice command and sends it for transcription"
-      />
+      {cameraVisible ? (
+        <CameraView ref={cameraRef} style={styles.camera} facing="back" />
+      ) : (
+        <View style={[styles.camera, styles.cameraOff]}>
+          <Ionicons name="mic" size={64} color="#fff" />
+          <Text style={styles.cameraOffText}>Listening…</Text>
+        </View>
+      )}
+      <GestureDetector gesture={screenGesture}>
+        <View
+          style={StyleSheet.absoluteFill}
+          accessibilityRole="button"
+          accessibilityLabel={
+            isRecording
+              ? "Recording"
+              : "Tap to speak. Swipe up for find. Swipe down for list."
+          }
+          accessibilityHint="Tap records a voice command. Swipe up toggles find mode. Swipe down builds or saves a list."
+        />
+      </GestureDetector>
       <SafeAreaView style={styles.overlay} pointerEvents="box-none">
         <View style={styles.topBar} pointerEvents="box-none">
           <View style={styles.statusBadgeWrap}>
@@ -802,15 +993,30 @@ export default function Detector() {
               </View>
             )}
           </View>
-          <Pressable
-            style={styles.exitButton}
-            onPress={() => router.back()}
-            accessibilityRole="button"
-            accessibilityLabel="Stop detection and return home"
-            hitSlop={12}
-          >
-            <Ionicons name="close" size={28} color="#fff" />
-          </Pressable>
+          <View style={styles.topRight}>
+            {isRecording && (
+              <View style={styles.meter}>
+                <View
+                  style={[
+                    styles.meterFill,
+                    {
+                      height: `${meterPct(meterDb)}%`,
+                      backgroundColor: meterColor(meterDb),
+                    },
+                  ]}
+                />
+              </View>
+            )}
+            <Pressable
+              style={styles.exitButton}
+              onPress={() => router.back()}
+              accessibilityRole="button"
+              accessibilityLabel="Stop detection and return home"
+              hitSlop={12}
+            >
+              <Ionicons name="close" size={28} color="#fff" />
+            </Pressable>
+          </View>
         </View>
         <View style={styles.bottomPanel}>
           <Text style={styles.status} accessibilityLiveRegion="polite">
@@ -845,6 +1051,17 @@ export default function Detector() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
   camera: { flex: 1 },
+  cameraOff: {
+    backgroundColor: "#000",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cameraOffText: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "600",
+    marginTop: 12,
+  },
   overlay: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "space-between",
@@ -881,6 +1098,22 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     borderRadius: 22,
     backgroundColor: "rgba(0,0,0,0.55)",
+  },
+  topRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  meter: {
+    width: 12,
+    height: 44,
+    borderRadius: 6,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    overflow: "hidden",
+    justifyContent: "flex-end",
+  },
+  meterFill: {
+    width: "100%",
   },
   bottomPanel: {
     padding: 16,
